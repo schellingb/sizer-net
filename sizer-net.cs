@@ -35,10 +35,10 @@ using System.Drawing;
 using System.Reflection;
 using System.Windows.Forms;
 
-[assembly: System.Reflection.AssemblyTitle("Sizer.Net")]
-[assembly: System.Reflection.AssemblyProduct("sizer-net")]
-[assembly: System.Reflection.AssemblyVersion("1.0.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyTitle("Sizer.Net")]
+[assembly: AssemblyProduct("sizer-net")]
+[assembly: AssemblyVersion("1.1.0.0")]
+[assembly: AssemblyFileVersion("1.1.0.0")]
 [assembly: System.Runtime.InteropServices.ComVisible(false)]
 
 static class SizerNet
@@ -48,6 +48,7 @@ static class SizerNet
     static int TreeViewScrollX = 0;
     static string AssemblyPath;
     static long AssemblySize;
+    static string[] DependencyDirs, IgnoredDependencies;
 
     [STAThread] static void Main(string[] args)
     {
@@ -102,12 +103,12 @@ static class SizerNet
 
     static void BrowseAssembly(bool InitialLoad = false)
     {
-        var fbd = new OpenFileDialog();
-        fbd.ValidateNames = fbd.CheckFileExists = fbd.CheckPathExists = true;
-        fbd.Filter = ".Net Assemblies (*.exe, *.dll)|*.exe;*.dll";
-        if (fbd.ShowDialog() != DialogResult.OK) { if (InitialLoad) f.Close(); return; }
-        fbd.Dispose();
-        LoadAssembly(fbd.FileName, InitialLoad);
+        var ofd = new OpenFileDialog();
+        ofd.ValidateNames = ofd.CheckFileExists = ofd.CheckPathExists = true;
+        ofd.Filter = ".Net Assemblies (*.exe, *.dll)|*.exe;*.dll";
+        if (ofd.ShowDialog() != DialogResult.OK) { if (InitialLoad) f.Close(); return; }
+        ofd.Dispose();
+        LoadAssembly(ofd.FileName, InitialLoad);
     }
 
     static void OnTreeDrawNode(object sender, DrawTreeNodeEventArgs e)
@@ -129,32 +130,36 @@ static class SizerNet
         if (tv.Nodes[0].Bounds.X != TreeViewScrollX) { TreeViewScrollX = tv.Nodes[0].Bounds.X; tv.Invalidate(); }
     }
 
+    //estimated numbers for byte size of overhead introduced by various things
+    const int Overhead_Type            = 4+8*2;
+    const int Overhead_Field           = 2+2*2;
+    const int Overhead_Method          = 8+6*2;
+    const int Overhead_LocalVariable   = 4+1*2;
+    const int Overhead_Parameter       = 4+1*2;
+    const int Overhead_InterfaceImpl   = 0+2*2;
+    const int Overhead_Event           = 2+2*2;
+    const int Overhead_Property        = 2+2*2;
+    const int Overhead_CustomAttribute = 0+3*2;
+
     static void LoadAssembly(string InAssemblyPath, bool InitialLoad = false)
     {
         AssemblyPath = InAssemblyPath;
         try
         {
-            //estimated numbers for byte size of overhead introduced by various things
-            const int Overhead_Type            = 4+8*2;
-            const int Overhead_Field           = 2+2*2;
-            const int Overhead_Method          = 8+6*2;
-            const int Overhead_LocalVariable   = 4+1*2;
-            const int Overhead_Parameter       = 4+1*2;
-            const int Overhead_InterfaceImpl   = 0+2*2;
-            const int Overhead_Event           = 2+2*2;
-            const int Overhead_Property        = 2+2*2;
-            const int Overhead_CustomAttribute = 0+3*2;
-            const int Overhead_Constructor     = 8+6*2;
-
             tv.Nodes.Clear();
             AppDomain.CurrentDomain.AssemblyResolve -= ResolveExternalAssembly;
             AppDomain.CurrentDomain.AssemblyResolve += ResolveExternalAssembly;
             AssemblyPath = new FileInfo(AssemblyPath).FullName;
+            DependencyDirs = new [] { Path.GetDirectoryName(AssemblyPath), Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location) };
+            IgnoredDependencies = new string[0];
             Assembly assembly = Assembly.LoadFile(AssemblyPath);
+            bool IsReflectionOnly = false;
             AssemblySize = new FileInfo(assembly.Location).Length;
             if (AssemblyPath != assembly.Location && !FileContentsMatch(AssemblyPath, assembly.Location))
             {
-                MessageBox.Show("Requested assembly:\n" + AssemblyPath + "\n\nAssembly loaded by system:\n" + assembly.Location + "\n\nA different assembly was loaded because an assembly with the same name exists in the global assembly cache. The requested assembly can't be inspected.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
+                MessageBox.Show("Requested assembly:\n" + AssemblyPath + "\n\nAssembly loaded by system:\n" + assembly.Location + "\n\nA different assembly was loaded because an assembly with the same name exists in the global assembly cache.\n\nResorting to loading the assembly in 'reflection only' mode which disables dependency resolving which can make certain type evaluations impossible.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
+                assembly = Assembly.ReflectionOnlyLoadFrom(AssemblyPath);
+                IsReflectionOnly = true;
             }
 
             BindingFlags all = BindingFlags.DeclaredOnly | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance;
@@ -205,24 +210,21 @@ static class SizerNet
 
             foreach (Module module in assembly.GetModules())
             {
-                foreach (MethodInfo mi in module.GetMethods(all))
-                {
-                    TreeNode nMethod = nAssembly.Nodes.Add(module.Name + " " + mi.Name);
-                    int lenMi = (mi.GetMethodBody() == null ? 0 : mi.GetMethodBody().GetILAsByteArray().Length);
-                    lenMi += Overhead_Method + mi.Name.Length;
-                    foreach (ParameterInfo pi in mi.GetParameters()) lenMi += Overhead_Parameter + (pi.Name == null ? 0 : pi.Name.Length);
-                    foreach (Attribute ai in mi.GetCustomAttributes(false)) lenMi += Overhead_CustomAttribute;
-                    if (mi.GetMethodBody() != null) foreach (LocalVariableInfo lvi in mi.GetMethodBody().LocalVariables) lenMi += Overhead_LocalVariable;
-                    SetNodeTag(nMethod, lenMi);
-                }
+                foreach (MethodInfo mi in module.GetMethods(all)) AddMethodNode(nAssembly, mi);
 
                 int lenModuleFields = 0;
                 foreach (FieldInfo fi in module.GetFields(all)) lenModuleFields += Overhead_Field + fi.Name.Length;
                 if (lenModuleFields != 0) { TreeNode nModuleInfo = nAssembly.Nodes.Add(module.GetFields(all).Length.ToString() + " Fields in " + module.Name + " (Overhead)"); SetNodeTag(nModuleInfo, lenModuleFields);     }
             }
 
-            foreach (Type type in assembly.GetTypes())
+            Type[] AssemblyTypes;
+            try { AssemblyTypes = assembly.GetTypes(); }
+            catch (ReflectionTypeLoadException e) { AssemblyTypes = e.Types; }
+
+            int UnresolvedTypes = 0;
+            foreach (Type type in AssemblyTypes)
             {
+                if (type == null) { UnresolvedTypes++; continue; }
                 TreeNode nType = nAssembly;
                 bool IsStaticArrayInitType = type.Name.Contains("StaticArrayInitTypeSize=");
                 foreach (string NSPart in type.FullName.Split('.', '+'))
@@ -232,21 +234,26 @@ static class SizerNet
                 }
 
                 int lenType = Overhead_Type + type.FullName.Length;
-                foreach (Type      it in type.GetInterfaces()) lenType += Overhead_InterfaceImpl;
-                foreach (Attribute ai in type.GetCustomAttributes(false)) lenType += Overhead_CustomAttribute;
+                try { foreach (Type it in type.GetInterfaces()) lenType += Overhead_InterfaceImpl; } catch { }
+                #if DOTNET35
+                try { foreach (object ca in type.GetCustomAttributes(false)) lenType += Overhead_CustomAttribute; } catch { }
+                #else
+                try { foreach (CustomAttributeData ad in type.GetCustomAttributesData()) lenType += Overhead_CustomAttribute; } catch { }
+                #endif
                 SetNodeTag(nType, lenType);
 
-                int numTypeFields = 0, numTypeProperties = 0, numTypeEvents = 0, lenTypeFields = 0, lenTypeProperties = 0, lenTypeEvents = 0;
                 foreach (FieldInfo fi in type.GetFields(statics))
                 {
-                    if (fi.FieldType.ContainsGenericParameters || fi.FieldType.IsGenericType) continue;
                     try
                     {
-                        long fiSize = CalculateSize(fi.GetValue(null), fi.FieldType);
+                        if (fi.FieldType.ContainsGenericParameters || fi.FieldType.IsGenericType) continue;
+                        long fiSize = CalculateSize(IsReflectionOnly, fi.FieldType, fi);
                         if (fiSize > 0) SetNodeTag(nType.Nodes.Add("Static Field: " + fi.Name), fiSize);
                     }
                     catch (Exception) { }
                 }
+
+                int numTypeFields = 0, numTypeProperties = 0, numTypeEvents = 0, lenTypeFields = 0, lenTypeProperties = 0, lenTypeEvents = 0;
                 foreach (FieldInfo    fi in type.GetFields(all))     { numTypeFields++;     lenTypeFields     += Overhead_Field    + fi.Name.Length;                         }
                 foreach (PropertyInfo pi in type.GetProperties(all)) { numTypeProperties++; lenTypeProperties += Overhead_Property + (pi.Name == null ? 0 : pi.Name.Length); }
                 foreach (EventInfo    ei in type.GetEvents(all))     { numTypeEvents++;     lenTypeEvents     += Overhead_Event    + ei.Name.Length;                         }
@@ -254,37 +261,20 @@ static class SizerNet
                 if (lenTypeProperties != 0) SetNodeTag(nType.Nodes.Add(numTypeProperties.ToString() + " Properties (Overhead)"), lenTypeProperties);
                 if (lenTypeEvents     != 0) SetNodeTag(nType.Nodes.Add(numTypeEvents.ToString()     + " Events (Overhead)"),     lenTypeEvents);
 
-                foreach (ConstructorInfo ci in type.GetConstructors(all))
-                {
-                    TreeNode nCostructor = nType.Nodes.Add(ci.Name);
-                    int lenCi = (ci.GetMethodBody() == null ? 0 : ci.GetMethodBody().GetILAsByteArray().Length);
-                    lenCi += Overhead_Constructor + ci.Name.Length;
-                    foreach (ParameterInfo pi in ci.GetParameters()) lenCi += 16 + (pi.Name == null ? 0 : pi.Name.Length);
-                    foreach (Attribute ai in ci.GetCustomAttributes(false)) lenCi += Overhead_CustomAttribute;
-                    if (ci.GetMethodBody() != null) foreach (LocalVariableInfo lvi in ci.GetMethodBody().LocalVariables) lenCi += Overhead_LocalVariable;
-                    SetNodeTag(nCostructor, lenCi);
-                }
-                foreach (MethodInfo mi in type.GetMethods(all))
-                {
-                    TreeNode nMethod = nType.Nodes.Add(mi.Name);
-                    int lenMi = (mi.GetMethodBody() == null ? 0 : mi.GetMethodBody().GetILAsByteArray().Length);
-                    lenMi += Overhead_Method + mi.Name.Length;
-                    foreach (ParameterInfo pi in mi.GetParameters()) lenMi += Overhead_Parameter + (pi.Name == null ? 0 : pi.Name.Length);
-                    foreach (Attribute ai in mi.GetCustomAttributes(false)) lenMi += Overhead_CustomAttribute;
-                    if (mi.GetMethodBody() != null) foreach (LocalVariableInfo lvi in mi.GetMethodBody().LocalVariables) lenMi += Overhead_LocalVariable;
-                    SetNodeTag(nMethod, lenMi);
-                }
+                foreach (ConstructorInfo ci in type.GetConstructors(all)) AddMethodNode(nType, ci);
+                foreach (MethodInfo      mi in type.GetMethods(all))      AddMethodNode(nType, mi);
             }
+
             SetNodeTag(nAssembly.Nodes.Add("Other Overhead"), AssemblySize - (long)nAssembly.Tag);
             SortByNodeByTag(nAssembly.Nodes);
             //FilterNodeByTag(nAssembly.Nodes, AssemblySize/100);
             nAssembly.Expand();
             tv.Nodes.Add(nAssembly);
-        }
-        catch (System.Reflection.ReflectionTypeLoadException e)
-        {
-            MessageBox.Show("Required sub-assembly loading error:\n\n" + e.LoaderExceptions[0].Message, "Error", MessageBoxButtons.OK, MessageBoxIcon.Exclamation);
-            if (InitialLoad) f.Close();
+
+            if (UnresolvedTypes != 0)
+            {
+                MessageBox.Show(UnresolvedTypes.ToString() + " types could not be evaluated due to missing dependency errors.\nThese are included in the 'Other Overhead' entry.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
         }
         catch (Exception e)
         {
@@ -292,20 +282,46 @@ static class SizerNet
             if (InitialLoad) f.Close();
         }
     }
+    
+    static void AddMethodNode(TreeNode ParentNode, MethodBase mi)
+    {
+        TreeNode nMethod = ParentNode.Nodes.Add(mi.Name);
+        int lenMi = Overhead_Method + mi.Name.Length;
+        try { var mb = mi.GetMethodBody(); lenMi += mb.GetILAsByteArray().Length; foreach (LocalVariableInfo lvi in mb.LocalVariables) lenMi += Overhead_LocalVariable; } catch { }
+        try { foreach (ParameterInfo pi in mi.GetParameters()) lenMi += 16 + (pi.Name == null ? 0 : pi.Name.Length); } catch { }
+        #if DOTNET35
+        try { foreach (object ca in mi.GetCustomAttributes(false)) lenMi += Overhead_CustomAttribute; } catch { }
+        #else
+        try { foreach (CustomAttributeData ad in mi.GetCustomAttributesData()) lenMi += Overhead_CustomAttribute; } catch { }
+        #endif
+        SetNodeTag(nMethod, lenMi);
+    }
 
     static Assembly ResolveExternalAssembly(object sender, ResolveEventArgs args)
     {
+        if (System.Array.IndexOf<string>(IgnoredDependencies, args.Name) >= 0) return null;
+
         string DllFileName = new AssemblyName(args.Name).Name + ".dll";
+        foreach (string dir in DependencyDirs)
+        {
+            string TestAssemblyPath = Path.Combine(dir, DllFileName);
+            if (File.Exists(TestAssemblyPath)) return Assembly.LoadFile(TestAssemblyPath);
+        }
 
-        string ItsFolderPath = Path.GetDirectoryName(AssemblyPath);
-        string ItsAssemblyPath = Path.Combine(ItsFolderPath, DllFileName);
-        if (File.Exists(ItsAssemblyPath)) return Assembly.LoadFrom(ItsAssemblyPath);
-
-        string MyFolderPath = Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location);
-        string MyAssemblyPath = Path.Combine(MyFolderPath, DllFileName);
-        if (File.Exists(MyAssemblyPath)) return Assembly.LoadFrom(MyAssemblyPath);
-
-        return null;
+        var ofd = new OpenFileDialog();
+        ofd.Title = "Find dependency: " + args.Name;
+        ofd.ValidateNames = ofd.CheckFileExists = ofd.CheckPathExists = true;
+        ofd.FileName = DllFileName;
+        ofd.Filter = ".Net Dependencies (*.dll)|*.dll";
+        if (ofd.ShowDialog() != DialogResult.OK)
+        {
+            System.Array.Resize<string>(ref IgnoredDependencies, IgnoredDependencies.Length + 1);
+            IgnoredDependencies[IgnoredDependencies.Length - 1] = args.Name;
+            return null;
+        }
+        System.Array.Resize<string>(ref DependencyDirs, DependencyDirs.Length + 1);
+        DependencyDirs[DependencyDirs.Length - 1] = Path.GetDirectoryName(ofd.FileName);
+        return Assembly.LoadFile(ofd.FileName);
     }
 
     static void SetNodeTag(TreeNode n, long amount)
@@ -336,20 +352,27 @@ static class SizerNet
         if (TotalRemoved != 0) {  nc.Add("... <Filtered> ...").Tag = TotalRemoved; }
     }
 
-    static long CalculateSize(Object value, Type t)
+    static long CalculateSize(bool IsReflectionOnly, Type t, object FiOrValue = null)
     {
         if (t.IsArray)
         {
+            System.Array a = (System.Array)(FiOrValue is FieldInfo ? (IsReflectionOnly ? ((FieldInfo)FiOrValue).GetRawConstantValue() : ((FieldInfo)FiOrValue).GetValue(null)) : FiOrValue);
+            if (a == null || a.LongLength == 0) return 0;
             t = t.GetElementType();
             if (t.IsEnum) t = Enum.GetUnderlyingType(t);
-            if (!t.ContainsGenericParameters && !t.IsGenericType && t.IsValueType) return ((System.Array)value).LongLength * System.Runtime.InteropServices.Marshal.SizeOf(t);
+            if (!t.ContainsGenericParameters && !t.IsGenericType && (t.IsValueType || t.IsPointer || t.IsLayoutSequential)) return a.LongLength * System.Runtime.InteropServices.Marshal.SizeOf(t);
+            if (!t.IsArray && t != typeof(string)) return 0; //can't measure size
             long res = 0;
-            foreach (object v in (System.Array)value) res += CalculateSize(v, t);
+            foreach (object v in a) res += CalculateSize(IsReflectionOnly, t, v);
             return res;
         }
-        if (t == typeof(string) && value != null) return ((string)value).Length * 2;
-        if (t.IsEnum) return System.Runtime.InteropServices.Marshal.SizeOf(Enum.GetUnderlyingType(t));
-        return System.Runtime.InteropServices.Marshal.SizeOf(value);
+        if (t == typeof(string))
+        {
+            string s = (string)(FiOrValue is FieldInfo ? (IsReflectionOnly ? ((FieldInfo)FiOrValue).GetRawConstantValue() : ((FieldInfo)FiOrValue).GetValue(null)) : FiOrValue);
+            return (s == null ? 0 : s.Length * 2);
+        }
+        if (t.IsEnum) t = Enum.GetUnderlyingType(t);
+        return (!t.ContainsGenericParameters && !t.IsGenericType && (t.IsValueType || t.IsPointer || t.IsLayoutSequential) ? System.Runtime.InteropServices.Marshal.SizeOf(t) : 0);
     }
 
     static bool FileContentsMatch(string path1, string path2)
